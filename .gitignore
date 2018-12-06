@@ -1,0 +1,8 @@
+// Intermediate compilation objects
+*.o
+
+// Command outputs
+*.out
+
+// Compiled executable
+test
