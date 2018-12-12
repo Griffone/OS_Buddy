@@ -1,4 +1,5 @@
 #include "buddy.h"
+#include "bitmem.h"
 
 #include <assert.h>
 #include <time.h>
@@ -44,6 +45,7 @@ int main() {
 	
 	double default_times[TEST_COUNT] = {0.0};
 	double buddy_times[TEST_COUNT] = {0.0};
+	double bitmem_times[TEST_COUNT] = {0.0};
 	
 	struct timespec start_time;
 	double duration;
@@ -61,26 +63,47 @@ int main() {
 	
 	printf("\nBuddy memory management took total of %f%s\n\n", duration, TIME_UNIT);
 	
+	printf("Benchmarking bitmem memory management:\n");
+	get_now(&start_time);
+	benchmark(&bm_alloc, &bm_free, bitmem_times);
+	duration = get_time_since(&start_time);
+	
+	printf("\nBitmem memory management took total of %f%s\n\n", duration, TIME_UNIT);
+	
 	printf("Resulting times:\n");
-	printf("test                        ||   default  ||     buddy\n");
-	printf("tiny allocations            || %8.2f%s || %8.2f%s\n", default_times[0], TIME_UNIT, buddy_times[0], TIME_UNIT);
-	printf("zig-zag                     || %8.2f%s || %8.2f%s\n", default_times[1], TIME_UNIT, buddy_times[1], TIME_UNIT);
-	printf("occasional free             || %8.2f%s || %8.2f%s\n", default_times[2], TIME_UNIT, buddy_times[2], TIME_UNIT);
-	printf("large allocations           || %8.2f%s || %8.2f%s\n", default_times[3], TIME_UNIT, buddy_times[3], TIME_UNIT);
-	printf("increasing size allocations || %8.2f%s || %8.2f%s\n", default_times[4], TIME_UNIT, buddy_times[4], TIME_UNIT);
-	printf("sweeping free               || %8.2f%s || %8.2f%s\n", default_times[5], TIME_UNIT, buddy_times[5], TIME_UNIT);
-	printf("clamped allocations         || %8.2f%s || %8.2f%s\n", default_times[6], TIME_UNIT, buddy_times[6], TIME_UNIT);
-	printf("random allocations          || %8.2f%s || %8.2f%s\n", default_times[7], TIME_UNIT, buddy_times[7], TIME_UNIT);
-	printf("even free                   || %8.2f%s || %8.2f%s\n", default_times[8], TIME_UNIT, buddy_times[8], TIME_UNIT);
-	printf("flipping                    || %8.2f%s || %8.2f%s\n", default_times[9], TIME_UNIT, buddy_times[9], TIME_UNIT);
-	printf("complete cleanup            || %8.2f%s || %8.2f%s\n", default_times[10], TIME_UNIT, buddy_times[10], TIME_UNIT);
+	printf("test                        ||   default  ||    buddy   ||    bitmem\n");
+	printf("tiny allocations            || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[0], TIME_UNIT, buddy_times[0], TIME_UNIT, bitmem_times[0], TIME_UNIT);
+	printf("zig-zag                     || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[1], TIME_UNIT, buddy_times[1], TIME_UNIT, bitmem_times[1], TIME_UNIT);
+	printf("occasional free             || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[2], TIME_UNIT, buddy_times[2], TIME_UNIT, bitmem_times[2], TIME_UNIT);
+	printf("large allocations           || %8.2f%s || %8.2f%s || %8.2f%s\n", 
+		default_times[3], TIME_UNIT, buddy_times[3], TIME_UNIT, bitmem_times[3], TIME_UNIT);
+	printf("increasing size allocations || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[4], TIME_UNIT, buddy_times[4], TIME_UNIT, bitmem_times[4], TIME_UNIT);
+	printf("sweeping free               || %8.2f%s || %8.2f%s || %8.2f%s\n", 
+		default_times[5], TIME_UNIT, buddy_times[5], TIME_UNIT, bitmem_times[5], TIME_UNIT);
+	printf("clamped allocations         || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[6], TIME_UNIT, buddy_times[6], TIME_UNIT, bitmem_times[6], TIME_UNIT);
+	printf("random allocations          || %8.2f%s || %8.2f%s || %8.2f%s\n", 
+		default_times[7], TIME_UNIT, buddy_times[7], TIME_UNIT, bitmem_times[7], TIME_UNIT);
+	printf("even free                   || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[8], TIME_UNIT, buddy_times[8], TIME_UNIT, bitmem_times[8], TIME_UNIT);
+	printf("flipping                    || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[9], TIME_UNIT, buddy_times[9], TIME_UNIT, bitmem_times[9], TIME_UNIT);
+	printf("complete cleanup            || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_times[10], TIME_UNIT, buddy_times[10], TIME_UNIT, bitmem_times[10], TIME_UNIT);
 	double default_duration = 0.0;
 	double buddy_duration = 0.0;
+	double bitmem_duration = 0.0;
 	for (int i = 0; i < TEST_COUNT; ++i) {
 		default_duration += default_times[i];
 		buddy_duration += buddy_times[i];
+		bitmem_duration += bitmem_times[i];
 	}
-	printf("total time                  || %8.2f%s || %8.2f%s\n", default_duration, TIME_UNIT, buddy_duration, TIME_UNIT);
+	printf("total time                  || %8.2f%s || %8.2f%s || %8.2f%s\n",
+		default_duration, TIME_UNIT, buddy_duration, TIME_UNIT, bitmem_duration, TIME_UNIT);
 	return 0;
 }
 
