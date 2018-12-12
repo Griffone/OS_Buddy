@@ -12,18 +12,25 @@
 
 #define check_bounds(x)		assert(x <= MAX_LEVEL)	// redefine this to skip assertion
 
-/// Global list of blocks
-struct BlockHead *freeBlocks[LEVELS] = {NULL};
-
-enum Flag {Free = 0, Taken = 1};
 
 typedef int level_t;
+
+enum Flag {Free = 0, Taken = 1};
 
 struct BlockHead {
 	enum Flag			status;			// Is the block taken?
 	level_t				level;			// Level of the block (0=lowest (32 bytes), 7=highest (page))
 	struct BlockHead	*next, *prev;	// Double-linked list
 };
+
+
+/// Global list of blocks
+struct BlockHead *freeBlocks[LEVELS] = {NULL};
+
+void printBlock(struct BlockHead *block) {
+	const char *status = (block->status == Free) ? "Free" : "Taken";
+	printf("{addr=%p, level=%i, status=%s}", block, block->level, status);
+}
 
 /// Map a new block head
 ///
@@ -42,9 +49,9 @@ struct BlockHead *newBlock() {
 		return NULL;	// this should throw an exception in any reasonable language, but in C malloc is noexcep...
 	}
 	assert(((long int)new & 0xfff) == 0);	// mmap with MAP_ANONYMOUS flag should be preinitialized to 0
+	
 	new->status = Free;
 	new->level = MAX_LEVEL;
-	
 	new->next = new->prev = NULL;	// technically not necessary, but this is actually important logically
 	
 	return new;
@@ -68,7 +75,11 @@ struct BlockHead *split(struct BlockHead *block) {
 	level_t index = --block->level;
 	long int mask = 0x1 << (index + MIN);
 	struct BlockHead *new = (struct BlockHead*)((long int)block | mask);
+	// New used to be user data, so we clean it
 	new->level = index;
+	new->prev = new->next = NULL;
+	new->status = Free;
+	
 	return new;
 }
 
@@ -88,10 +99,13 @@ struct BlockHead *primary(struct BlockHead *block) {
 /// Returns the resulting larger block
 /// Updates the resulting block level
 struct BlockHead *merge(struct BlockHead *block) {
-	level_t index = block->level;
-	long int mask = ~0x0 << (1 + index + MIN);
+	level_t index = block->level + 1;
+	long int mask = ~0x0 << (index + MIN);
 	struct BlockHead *new = (struct BlockHead*)((long int)block & mask);
-	new->level = index + 1;
+	// Unlike split
+	// The location of the new head is the same as the location of the old head
+	// So there is no need to clean
+	new->level = index;
 	return new;
 }
 
@@ -146,8 +160,9 @@ struct BlockHead *find(int level) {
 			if (parent->prev) {
 				parent->prev->next = parent->next;
 			}
-			parent->prev = parent->next = NULL;	// We lower the level of the parent, so it doesn't belong to its list any more
-			freeBlocks[level] = parent;
+			// We lower the level of the parent, so it doesn't belong to its list any more
+			parent->prev = parent->next = NULL;
+			freeBlocks[level] = parent;	// We know freeBlocks[level] is NULL
 			return split(parent);
 		}
 	}
@@ -160,18 +175,6 @@ struct BlockHead *find(int level) {
 /// If it isn't - push the fresh block to the freeBlocks list
 /// Don't forget to mark the block as free
 void insert(struct BlockHead *block) {
-	for (level_t i = 0; i < LEVELS; ++i) {
-		if (freeBlocks[i] != NULL) {
-			if (freeBlocks[i]->level != i) {
-				printf("\nCorrupted block (%i): ", i);
-				printBlock(freeBlocks[i]);
-				printf("\nwhile trying to insert:");
-				printBlock(block);
-				printf("\n");
-				assert(0);
-			}
-		}
-	}
 	level_t level = block->level;
 	// Since merging pages doesn't make sense check that this isn't a a full page
 	if (level != MAX_LEVEL) {
@@ -184,11 +187,15 @@ void insert(struct BlockHead *block) {
 				// Remove buddy from the list
 				bud->prev->next = bud->next;
 			}
+			if (bud->next != NULL) {
+				bud->next->prev = bud->prev;
+			}
 			if (freeBlocks[level] == bud) {
 				// The buddy is about to be merged, so its level is about to be incremented
 				freeBlocks[level] = bud->next;
 			}
 			block = merge(block);
+			assert(block->level == level + 1);
 			return insert(block);	// eventually the biggest free block will be marked as Free, we can avoid doing it eagerly here
 		}
 	}
@@ -200,6 +207,7 @@ void insert(struct BlockHead *block) {
 	} else {
 		block->next = NULL;
 	}
+	block->prev = NULL;
 	block->status = Free;
 	freeBlocks[level] = block;
 }
@@ -219,13 +227,9 @@ void *balloc(size_t size) {
 void bfree(void *memory) {
 	if (memory != NULL) {
 		struct BlockHead *block = unhideHead(memory);
+		assert(block->status = Taken);
 		insert(block);
 	}
-}
-
-void printBlock(struct BlockHead *block) {
-	const char *status = (block->status == Free) ? "Free" : "Taken";
-	printf("{addr=%p, level=%i, status=%s}", block, block->level, status);
 }
 
 void printFreeLists() {
