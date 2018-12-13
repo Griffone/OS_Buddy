@@ -17,26 +17,25 @@ typedef int level_t;
 
 enum Flag {Free = 0, Taken = 1};
 
-struct BlockHead {
-	enum Flag			status;			// Is the block taken?
-	level_t				level;			// Level of the block (0=lowest (32 bytes), 7=highest (page))
-	struct BlockHead	*next, *prev;	// Double-linked list
-};
+typedef struct BlockHead {
+	enum Flag	status;
+	level_t		level;
+} BlockHead;
+
+typedef struct FreeBlockHead {
+	struct BlockHead		header;
+	struct FreeBlockHead	*next, *prev;
+} FreeBlockHead;
 
 
 /// Global list of blocks
-struct BlockHead *freeBlocks[LEVELS] = {NULL};
-
-void printBlock(struct BlockHead *block) {
-	const char *status = (block->status == Free) ? "Free" : "Taken";
-	printf("{addr=%p, level=%i, status=%s}", block, block->level, status);
-}
+FreeBlockHead *freeBlocks[LEVELS] = {NULL};
 
 /// Map a new block head
 ///
 /// Traps to OS to allocate a new page
-struct BlockHead *newBlock() {
-	struct BlockHead *new = (struct BlockHead *) mmap(
+FreeBlockHead *newBlock() {
+	FreeBlockHead *new = (FreeBlockHead*) mmap(
 													NULL,							// hint for OS memory location, we let it decide
 													PAGE,							// size of the newly mapped memory
 													PROT_READ | PROT_WRITE,			// access mode
@@ -50,8 +49,8 @@ struct BlockHead *newBlock() {
 	}
 	assert(((long int)new & 0xfff) == 0);	// mmap with MAP_ANONYMOUS flag should be preinitialized to 0
 	
-	new->status = Free;
-	new->level = MAX_LEVEL;
+	new->header.status = Free;
+	new->header.level = MAX_LEVEL;
 	new->next = new->prev = NULL;	// technically not necessary, but this is actually important logically
 	
 	return new;
@@ -60,7 +59,7 @@ struct BlockHead *newBlock() {
 /// Find a buddy (second half of a larger block) of a given block
 ///
 /// This is done by flipping the bit that differenciates the given block from the body
-struct BlockHead *buddy(struct BlockHead *block) {
+BlockHead *buddy(BlockHead *block) {
 	level_t index = block->level;
 	long int mask = 0x1 << (index + MIN);
 	return (struct BlockHead*)((long int)block ^ mask);
@@ -71,14 +70,14 @@ struct BlockHead *buddy(struct BlockHead *block) {
 /// Splits the given block in half
 /// Lowers the level of the returned and initial blocks
 /// Does NOT remove the block from the list
-struct BlockHead *split(struct BlockHead *block) {
-	level_t index = --block->level;
+FreeBlockHead *split(FreeBlockHead *block) {
+	level_t index = --block->header.level;
 	long int mask = 0x1 << (index + MIN);
-	struct BlockHead *new = (struct BlockHead*)((long int)block | mask);
+	FreeBlockHead *new = (FreeBlockHead*)((long int)block | mask);
 	// New used to be user data, so we clean it
-	new->level = index;
+	new->header.level = index;
+	new->header.status = Free;
 	new->prev = new->next = NULL;
-	new->status = Free;
 	
 	return new;
 }
@@ -86,10 +85,10 @@ struct BlockHead *split(struct BlockHead *block) {
 /// Find the primary block
 ///
 /// Returns the location of the block that has lower memory address
-struct BlockHead *primary(struct BlockHead *block) {
+BlockHead *primary(BlockHead *block) {
 	level_t index = block->level;
 	long int mask = ~0x0 << (1 + index + MIN);	// ~0x0 is everything set to 1 (-1) (0xFFFFFFFFFFFFFFFF)
-	return (struct BlockHead *)((long int)block & mask);
+	return (BlockHead *)((long int)block & mask);
 }
 
 /// Merges the 2 buddies
@@ -98,22 +97,23 @@ struct BlockHead *primary(struct BlockHead *block) {
 /// Can be supplied with either of the buddy block
 /// Returns the resulting larger block
 /// Updates the resulting block level
-struct BlockHead *merge(struct BlockHead *block) {
-	level_t index = block->level + 1;
+FreeBlockHead *merge(FreeBlockHead *block) {
+	level_t index = block->header.level + 1;
 	long int mask = ~0x0 << (index + MIN);
-	struct BlockHead *new = (struct BlockHead*)((long int)block & mask);
+	FreeBlockHead *new = (FreeBlockHead*)((long int)block & mask);
 	// Unlike split
 	// The location of the new head is the same as the location of the old head
 	// So there is no need to clean
-	new->level = index;
+	new->header.level = index;
+	new->prev = new->next = NULL;
 	return new;
 }
 
-void *hideHead(struct BlockHead *block) {
+void *hideHead(BlockHead *block) {
 	return (void*)(block + 1);
 }
 
-struct BlockHead *unhideHead(void *memory) {
+BlockHead *unhideHead(void *memory) {
 	return ((struct BlockHead*)memory - 1);
 }
 
@@ -140,10 +140,10 @@ int level(int requestedSize) {
 /// If there isn't one - recursively tries to find a larger free block
 /// If the largest possible block (a full page) is still not found
 /// requests the kernel to allocate a new page and unwinds the call stack.
-struct BlockHead *find(int level) {
+FreeBlockHead *find(int level) {
 	if (freeBlocks[level] != NULL) {
 		// Turns out we already have a free block of right size
-		struct BlockHead *returnedBlock = freeBlocks[level];
+		FreeBlockHead *returnedBlock = freeBlocks[level];
 		// Because of freeing we might have a non-adjacent free page
 		freeBlocks[level] = freeBlocks[level]->next;
 		return returnedBlock;
@@ -156,10 +156,9 @@ struct BlockHead *find(int level) {
 			// We find a free bigger block and split it
 			// Note: since we find a bigger block the buddy of the returned block is free
 			// so we append it to the list
-			struct BlockHead *parent = find(level + 1);
-			if (parent->prev) {
-				parent->prev->next = parent->next;
-			}
+			FreeBlockHead *parent = find(level + 1);
+			if (parent->prev) parent->prev->next = parent->next;
+			if (parent->next) parent->next->prev = parent->prev;
 			// We lower the level of the parent, so it doesn't belong to its list any more
 			parent->prev = parent->next = NULL;
 			freeBlocks[level] = parent;	// We know freeBlocks[level] is NULL
@@ -174,28 +173,23 @@ struct BlockHead *find(int level) {
 /// If it is - merge and recursively insert the resulting larger block
 /// If it isn't - push the fresh block to the freeBlocks list
 /// Don't forget to mark the block as free
-void insert(struct BlockHead *block) {
-	level_t level = block->level;
+void insert(FreeBlockHead *block) {
+	level_t level = block->header.level;
 	// Since merging pages doesn't make sense check that this isn't a a full page
 	if (level != MAX_LEVEL) {
-		struct BlockHead *bud = buddy(block);
+		BlockHead *bud = buddy((BlockHead*)block);
 		// This if is not obvious, but we are guaranteed (with correct free use)
 		// That the buddy address is not user data, but a buddy head
 		// However that buddy might be of a lower level, thus unmergable
 		if (bud->status == Free && bud->level == level) {
-			if (bud->prev != NULL) {
-				// Remove buddy from the list
-				bud->prev->next = bud->next;
-			}
-			if (bud->next != NULL) {
-				bud->next->prev = bud->prev;
-			}
-			if (freeBlocks[level] == bud) {
+			FreeBlockHead *freeBuddy = (FreeBlockHead*)bud;
+			if (freeBuddy->next) freeBuddy->next->prev = freeBuddy->prev;
+			if (freeBuddy->prev) freeBuddy->prev->next = freeBuddy->next;
+			if (freeBlocks[level] == freeBuddy) {
 				// The buddy is about to be merged, so its level is about to be incremented
-				freeBlocks[level] = bud->next;
+				freeBlocks[level] = freeBuddy->next;
 			}
 			block = merge(block);
-			assert(block->level == level + 1);
 			return insert(block);	// eventually the biggest free block will be marked as Free, we can avoid doing it eagerly here
 		}
 	}
@@ -208,7 +202,7 @@ void insert(struct BlockHead *block) {
 		block->next = NULL;
 	}
 	block->prev = NULL;
-	block->status = Free;
+	block->header.status = Free;
 	freeBlocks[level] = block;
 }
 
@@ -218,7 +212,7 @@ void *balloc(size_t size) {
 	
 	int index = level(size);
 	check_bounds(index);	// in-source functions do no parameter checking, since the developer is hopefully not an idiot
-	struct BlockHead *block = find(index);
+	BlockHead *block = (BlockHead*)find(index);
 	block->status = Taken;
 	return hideHead(block);
 }
@@ -226,70 +220,11 @@ void *balloc(size_t size) {
 /// Free memory
 void bfree(void *memory) {
 	if (memory != NULL) {
-		struct BlockHead *block = unhideHead(memory);
+		BlockHead *block = unhideHead(memory);
 		assert(block->status = Taken);
-		insert(block);
+		FreeBlockHead *freeBlock = (FreeBlockHead*)block;
+		// used to be user data, so we clean this
+		freeBlock->next = freeBlock->prev = NULL;
+		insert(freeBlock);
 	}
-}
-
-void printFreeLists() {
-	printf("Free Blocks:\n");
-	for (level_t level = MAX_LEVEL; level >= 0; --level) {
-		printf("%i:\t", level);
-		struct BlockHead *block = freeBlocks[level];
-		while (block) {
-			printBlock(block);
-			printf("-");
-			block = block->next;
-		}
-		printf("{NULL}\n");
-	}
-}
-
-void verboseTest() {
-	printf("Runnign verbose test\n");
-	printf("Initial free blocks:\n");
-	printFreeLists();
-	
-	// 12 * 4 = 48 of data + 24 of overhead = 72 required size, fits into 128 byte size (level == 2)
-	int *testArray = (int *)balloc(12 * sizeof(int));
-	assert(testArray != NULL);
-	
-	assert(unhideHead(testArray)->level = 2);
-	for (int i = 0; i < 12; ++i) {
-		testArray[i] = i * 60;
-	}
-	
-	// we want to use a larger sized block, but we expect it to be 256+128 bytes away from testArray
-	char *anotherTest = (char *)balloc(128 *sizeof(char));
-	assert(anotherTest != NULL);
-	assert(unhideHead(anotherTest)->level == 3);
-	assert(unhideHead(anotherTest)->status == Taken);
-	assert((long int)testArray - (long int)anotherTest == 0x180);
-	
-	// Now we just get a new page alltogether
-	int *page = (int *)balloc(1000 * sizeof(int));
-	
-	
-	printf("\nAfter allocations:\n");
-	printFreeLists();
-	
-	bfree(anotherTest);
-	assert(unhideHead(anotherTest)->status == Free);	
-	bfree(testArray);
-	bfree(page);
-	
-	printf("\nAfter frees:\n");
-	printFreeLists();
-	
-	char *string = (char *)balloc(sizeof("Some string"));
-	assert(*string == 0);
-	
-	printf("\nAfter new allocation:\n");
-	printFreeLists();
-	
-	bfree(string);
-	
-	printf("\nAfter final free:\n");
-	printFreeLists();
 }

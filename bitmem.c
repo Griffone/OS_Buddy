@@ -12,8 +12,6 @@
 
 #define check_bounds(x)		assert(x <= MAX_LEVEL)	// redefine this to skip assertion
 
-#define PAGE_MASK_ADDRESS	0xFFFFFFFFFFFFF000
-#define PAGE_MASK_OTHER		~PAGE_MASK_ADDRESS
 
 // Optional safety
 #define CLEAN_PAGE_ADDRESS		1
@@ -28,26 +26,39 @@ typedef struct BlockHead {
 	bitfield_t	bitfield;
 } BlockHead;
 
-// 32-byte page head
-//
-// First 16 bytes are 128 block identifiers for 32-byte-sized blocks
-// The second 16 bytes are two pointers to other page headers
-typedef struct PageHead {
-	unsigned char	blocks[16];
-	// PAGE_MASK_ADDRESS bits contain address of the next page in list
-	// PAGE_MASK_OTHER bits contain number of free bits
-	struct PageHead	*next;
-	// PAGE_MASK_ADDRESS bits contain address of the previous page in list
-	struct PageHead	*prev;
-} PageHead;
+typedef struct PageDescriptor {
+	// We have 128 actual blocks (lowest level)
+	// But we then have a bit for each level to optimize allocation timing
+	// This is free memory wise (the page descriptor is 32 bytes already and needs a BlockHead, so 40 bytes takes the same size
+	bitfield_t				blocks[2];
+	struct PageDescriptor	*next, *prev;
+	void 					*page;
+} PageDescriptor;
 
 
-static PageHead *first_page = NULL;
+static struct {
+	struct PageDescriptor *front, *back;
+} pages;
 
+// Note: There might be an obvious mathematic interpretation if one reorders some bits,
+// but I didn't find one
+static int const LEVEL_OFFSETS = {
+	0,		// level 0:   0-127
+	128,	// level 1: 128-191
+	192,	// level 2: 192-223
+	244,	// level 3: 224-239
+	240,	// level 4: 240-247
+	248,	// level 5: 248-251
+	252,	// level 6: 252-253
+	254,	// level 7: 254-254
+	255		// Last size, might be used by internal algorithms (ie, upper bound for level 7)
+};
 
 #define BITFIELD_LEVEL				0x0000000000000007
-#define BITFIELD_STATUSFLAG			0x0000000000000008
-#define BITFIELD_UNUSED				0xFFFFFFFFFFFFFFF0
+#define BITFIELD_STATUSFLAG			0x0000000000000800
+#define BITFIELD_UNUSED				0x00000000000007F8
+#define BITFIELD_ADDRESS			0xFFFFFFFFFFFFF000
+#define BITFIELD_OTHER				0x0000000000000FFF
 
 #define set_free(bitfield)			bitfield |= BITFIELD_STATUSFLAG
 #define set_taken(bitfield) 		bitfield &= ~BITFIELD_STATUSFLAG
@@ -57,32 +68,65 @@ static PageHead *first_page = NULL;
 #define set_level(bitfield, level)	bitfield = (bitfield & ~BITFIELD_LEVEL) | level
 #define get_level(bitfield)			(bitfield & BITFIELD_LEVEL)
 
-static inline void set_page(PageHead **pointer, PageHead *page) {
+static inline void set_page(bitfield_t *bitfield, PageDescriptor *page) {
 #if CLEAN_PAGE_ADDRESS
-	*pointer = (PageHead *)(((long int) *pointer & ~PAGE_MASK_ADDRESS) | ((long int) page & PAGE_MASK_ADDRESS));
+	*bitfield = (*bitfield & ~BITFIELD_ADDRESS) | ((bitfield_t) page & BITFIELD_ADDRESS);
 #else // CLEAN_PAGE_ADDRESS
-	*pointer = (PageHead *)(((long int) *pointer & ~PAGE_MASK_ADDRESS) | (long int) page);
+	*bitfield = (*bitfield & ~BITFIELD_ADDRESS) | (bitfield_t) page;
 #endif // CLEAN_PAGE_ADDRESS
 }
 
-static inline PageHead *get_page(PageHead *pointer) {
-	return (PageHead*)((long int) pointer & PAGE_MASK_ADDRESS);
+static inline PageDescriptor *get_page(bitfield_t bitfield) {
+	return (PageDescriptor*)(bitfield & BITFIELD_ADDRESS);
 }
 
-static inline void set_other(PageHead **pointer, long int value) {
-	*pointer = (PageHead*)(((long int) *pointer & ~PAGE_MASK_OTHER) | (value & PAGE_MASK_OTHER));
+static inline void set_other(bitfield_t *bitfield, long int value) {
+	*bitfield = (*bitfield & ~BITFIELD_OTHER) | (value & BITFIELD_OTHER);
 }
 
-static inline long int get_other(PageHead *pointer) {
-	return (long int)pointer & PAGE_MASK_OTHER;
+static inline long int get_other(bitfield_t bitfield) {
+	return (bitfield & BITFIELD_OTHER);
 }
+
+static inline void push_page(PageDescriptor *page) {
+	if (pages.back != NULL) {
+		pages.back->next = page;
+		page->prev = pages.back;
+		pages.back = page;
+	} else {
+		pages.back = pages.front = page;
+	}
+}
+
+static inline PageDescriptor *pop_page(PageDescriptor *page) {
+	if (page->prev != NULL) page->prev->next = page->next;
+	if (page->next != NULL) page->next->prev = page->prev;
+	if (pages.front == page) pages.front = page->next;
+	if (pages.back == page) pages.back = page->prev;
+}
+
+static inline int get_bit(bitfield_t *bitfields, int bit) {
+	int offset = bit / (sizeof(bitfield_t) * 8);
+	bitfield_t mask = 1 << bit % (sizeof(bitfield_t) * 8);
+	return bitfields[offset] & mask == mask;
+}
+
+static inline void set_bit(bitfield_t *bitfields, int bit, int value) {
+	int offset = bit / (sizeof(bitfield_t) * 8);
+	bitfield_t mask = 1 << bit % (sizeof(bitfield_t) * 8);
+	bitfield_t val = value << bit % (sizeof(bitfield_t) * 8);
+	bitfields[offset] = (bitfields[offset] & ~mask) | value;
+}
+
+
+static void init() __attribute__((constructor));
 
 
 /// Allocate a new page from OS.
 ///
 /// Maps a new Page and initializes its PageHead
-PageHead *page_new() {
-	struct PageHead *new = (PageHead *) mmap(
+void *map_new_page() {
+	void *new = mmap(
 		NULL,							// hint for OS memory location, we let it decide
 		PAGE,							// size of the newly mapped memory
 		PROT_READ | PROT_WRITE,			// access mode
@@ -94,47 +138,35 @@ PageHead *page_new() {
 	if (new == MAP_FAILED) return NULL;	// this should throw an exception in any reasonable language, but in C malloc is noexcep...
 	assert(((long int)new & 0xfff) == 0);	// mmap with MAP_ANONYMOUS flag should be preinitialized to 0
 	
-	new->blocks[0] = 0xE;	// first bit is '0', as its where this pagehead is
-	for (int i = 1; i < 16; ++i) new->blocks[i] = 0xF;
-	new->prev = new->next = NULL;
-	set_other(&new->next, 127);
-	
 #if ADDRESS_ASSERT
-	assert((void *) new == (void *)((long int) new & PAGE_MASK_ADDRESS));
+	assert(new == (void *)((long int) new & PAGE_MASK_ADDRESS));
 #endif // ADDRESS_ASSERT
 	
 	return new;
+}
+
+void init() {
+	void *first = map_new_page();
+	
+	PageDescriptor *page = (PageDescriptor*)first;
+	pages.front = pages.back = page;
+	
+	page->page = first;
+	
 }
 
 /// Tries to find a block of given level in given page
 ///
 /// Returns initialized BlockHead of correct level of NULL if there isn't enough free space in page
 BlockHead *page_take(PageHead *page, level_t level) {
-	int free_bits = get_other(page->next);
-	if (free_bits < 0x1 << level) return NULL;
-
-	// Evil bitwise manipulation
-	// Effectively left-shift with filler ones
-	unsigned char mask = ~(~0x1 << level);
-
-	unsigned long int end_offset = (128 - (0x1 << level)) + 1;
-	for (unsigned long int offset = 0; offset < end_offset; ++offset) {
-		unsigned char this = mask << (offset % 8);
-		unsigned char that = ~this;	// flip all bits of this
-		if (page->blocks[offset / 8] & this == this
-			&& page->blocks[(offset / 8) + 1] & that == that) {
-			// We have found our block
-			BlockHead *block = (BlockHead *)(page + offset);
-			set_taken(block->bitfield);
-			set_level(block->bitfield, level);
+	// Still uses buddy algorithm to optimise sarch time
+	bitfield_t bits = 1 << level;
+	bitfield_t pos = 0;
+	for (bitfield_t bit = 0; bit < 128; ++bit) {
+		if (!get_bit(page->blocks, bit)) {
+			pos = bit + 1;
+		} else if (bit - pos == bits) {
 			
-			// We need to flip bits that are in 'this', we already did it with 'that'
-			page->blocks[offset / 8] &= that;
-			page->blocks[(offset / 8) + 1] &= this;
-			
-			set_other(&page->next, free_bits - 0x1 << level);
-			
-			return block;
 		}
 	}
 	
@@ -151,7 +183,6 @@ BlockHead *take(level_t level) {
 	PageHead *page = first_page;
 	
 	while (get_page(page->next) != NULL) {
-		//printf("Spinning\n");
 		BlockHead *block = page_take(page, level);
 		
 		if (block != NULL) return block;
@@ -181,7 +212,7 @@ void free_block(BlockHead *block) {
 	level_t level = get_level(block->bitfield);
 	unsigned char mask = ~(~0x1 << level);
 	
-	long int offset = (long int)block - (long int)page;
+	long int offset = ((long int)block - (long int)page) / sizeof(BlockHead);
 
 #if PAGE_IN_RANGE_ASSERT
 	assert(offset <= 128);
@@ -210,25 +241,17 @@ struct BlockHead *unhide_head(void *memory) {
 /// Find the level of the necessary block for a given requested memory amount
 ///
 /// Find find the smallest block size that fits both the requested size of the data as well as the block head for that data
-level_t calc_level(size_t requestedSize) {
-	size_t total = requestedSize + sizeof(BlockHead);
-	
-	level_t level = 0;
-	size_t size = 1 << MIN;
-	while (size < total) {
-		size <<= 1;
-		level++;
-	}
-	
-	return level;
+int block_count(size_t requestedSize) {
+	return (requestedSize + sizeof(BlockHead)) / 32;
 }
 
 /// Allocate size bytes of memory
 void *bm_alloc(size_t size) {
 	if (size == 0) return NULL;
 	
-	level_t index = calc_level(size);
-	check_bounds(index);	// in-source functions do no parameter checking, since the developer is hopefully not an idiot
+	int blocks = block_count(size);
+	
+	assert(blocks < 128);
 	
 	BlockHead *block = take(index);
 
