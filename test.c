@@ -28,7 +28,7 @@ static inline double get_time_since(struct timespec *time) {
 	get_now(&now);
 	double seconds = now.tv_sec - time->tv_sec;
 	long nanos = (now.tv_nsec + (GIGA - time->tv_nsec)) % GIGA;
-	return seconds / TU_PER_SEC + (double) nanos / NANOS_PER_TU;
+	return seconds * TU_PER_SEC + (double) nanos / NANOS_PER_TU;
 }
 
 /// Benchmark given allocate and free functions
