@@ -9,6 +9,7 @@
 #define LEVELS				8
 #define MAX_LEVEL			LEVELS -1	// this is how numbers work
 #define PAGE				4096
+#define CACHED_PAGES		4
 
 #define check_bounds(x)		assert(x <= MAX_LEVEL)	// redefine this to skip assertion
 
@@ -29,7 +30,8 @@ typedef struct FreeBlockHead {
 
 
 /// Global list of blocks
-FreeBlockHead *freeBlocks[LEVELS] = {NULL};
+static FreeBlockHead *freeBlocks[LEVELS] = {NULL};
+static int num_of_free_pages = 0;
 
 /// Map a new block head
 ///
@@ -146,6 +148,7 @@ FreeBlockHead *find(int level) {
 		FreeBlockHead *returnedBlock = freeBlocks[level];
 		// Because of freeing we might have a non-adjacent free page
 		freeBlocks[level] = freeBlocks[level]->next;
+		if (level == MAX_LEVEL) num_of_free_pages--;
 		return returnedBlock;
 	} else {
 		// We need to create a new block of the right size
@@ -192,9 +195,15 @@ void insert(FreeBlockHead *block) {
 			block = merge(block);
 			return insert(block);	// eventually the biggest free block will be marked as Free, we can avoid doing it eagerly here
 		}
+	} else {
+		if (num_of_free_pages == CACHED_PAGES) {
+			munmap(block, PAGE);
+			return;
+		} else {
+			num_of_free_pages++;
+		}
 	}
 	
-	// This code is executed if either of the ifs fail
 	if (freeBlocks[level] != NULL) {
 		freeBlocks[level]->prev = block;
 		block->next = freeBlocks[level];
